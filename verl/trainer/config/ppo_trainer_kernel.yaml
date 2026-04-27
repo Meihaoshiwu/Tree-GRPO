@@ -1,0 +1,177 @@
+data:
+  tokenizer: null
+  train_files: ~/data/kernel_rl/train.parquet
+  val_files: null
+  train_data_num: null
+  val_data_num: null
+  prompt_key: prompt
+  task_spec_key: task_spec
+  bench_spec_key: bench_spec
+  reference_python_key: reference_python
+  max_prompt_length: 4096
+  max_response_length: 2048
+  max_start_length: 2048
+  max_obs_length: 2048
+  train_batch_size: 8
+  val_batch_size: 8
+  return_raw_input_ids: False
+  return_raw_chat: False
+  shuffle_train_dataloader: True
+  prompt_truncation: left
+
+actor_rollout_ref:
+  hybrid_engine: True
+  model:
+    path: ~/models/Qwen2.5-Coder-3B-Instruct
+    external_lib: null
+    override_config: {}
+    enable_gradient_checkpointing: False
+    use_remove_padding: False
+  actor:
+    strategy: fsdp
+    policy_loss: dual_clip
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size: 8
+    ppo_mini_batch_size_fixed: null
+    ppo_micro_batch_size_fixed: null
+    use_dynamic_bsz: False
+    ppo_max_token_len_per_gpu: 32768
+    grad_clip: 1.0
+    state_masking: False
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    clip_ratio_c: 3.0
+    loss_agg_mode: token-mean
+    entropy_coeff: 0.001
+    use_kl_loss: False
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    ppo_epochs: 1
+    shuffle: False
+    ulysses_sequence_parallel_size: 1
+    multi_advantage:
+      enabled: True
+    optim:
+      lr: 1e-6
+      lr_warmup_steps_ratio: 0.
+      min_lr_ratio: null
+      warmup_style: constant
+      total_training_steps: -1
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 0
+      param_offload: False
+      grad_offload: False
+      optimizer_offload: False
+      fsdp_size: -1
+  ref:
+    fsdp_config:
+      param_offload: False
+      wrap_policy:
+        min_num_params: 0
+      fsdp_size: -1
+    log_prob_micro_batch_size: 64
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
+  rollout:
+    name: vllm
+    temperature: 1.0
+    top_k: -1
+    top_p: 0.95
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    dtype: bfloat16
+    gpu_memory_utilization: 0.6
+    ignore_eos: False
+    enforce_eager: True
+    free_cache_engine: True
+    load_format: dummy_dtensor
+    tensor_model_parallel_size: 1
+    max_num_batched_tokens: 16384
+    max_num_seqs: 256
+    log_prob_micro_batch_size: 64
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    do_sample: True
+    n: 1
+    n_agent: 1
+    tree_search: False
+
+critic:
+  strategy: fsdp
+  optim:
+    lr: 1e-5
+    lr_warmup_steps_ratio: 0.
+    min_lr_ratio: null
+    warmup_style: constant
+    total_training_steps: -1
+  model:
+    path: ${actor_rollout_ref.model.path}
+    tokenizer_path: ${actor_rollout_ref.model.path}
+    override_config: {}
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    enable_gradient_checkpointing: False
+    use_remove_padding: False
+    fsdp_config:
+      param_offload: False
+      grad_offload: False
+      optimizer_offload: False
+      wrap_policy:
+        min_num_params: 0
+      fsdp_size: -1
+  ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
+  ppo_micro_batch_size: 8
+  forward_micro_batch_size: ${critic.ppo_micro_batch_size}
+  use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+  ppo_max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: ${critic.ppo_max_token_len_per_gpu}
+  ulysses_sequence_parallel_size: 1
+  ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
+  shuffle: ${actor_rollout_ref.actor.shuffle}
+  grad_clip: 1.0
+  cliprange_value: 0.5
+
+reward_model:
+  enable: False
+
+algorithm:
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: no_estimator
+  kernel_adv_estimator: no_estimator
+  no_think_rl: False
+  kl_penalty: kl
+  use_kl_in_reward: False
+  kl_fix: none
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+
+kernel:
+  max_depth: 3
+  branch_factors: [2, 2, 2]
+  keep_per_depth: [4, 4, 8]
+  scorer:
+    mode: log_only
+    num_workers: 2
+    timeout_s: 300
+    log_dir: ./kernel_scorer_logs
+
+trainer:
+  total_epochs: 1
+  total_training_steps: null
+  project_name: verl_kernel
+  experiment_name: qwen25_coder_3b_tree_kernel
+  logger: ['console']
+  nnodes: 1
+  n_gpus_per_node: 4
+  save_freq: -1
+  test_freq: -1
+  critic_warmup: 0
+  default_hdfs_dir: ~/experiments/kernel_rl/${trainer.experiment_name}
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+
+max_turns: 1
+do_search: false
