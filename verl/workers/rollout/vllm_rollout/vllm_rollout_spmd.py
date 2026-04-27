@@ -180,6 +180,7 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
+        sample_count = int(kwargs.get('n', getattr(self.config, 'n', 1)))
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -200,11 +201,14 @@ class vLLMRollout(BaseRollout):
         response = pad_2d_list_to_length(response, self.pad_token_id,
                                          max_length=self.config.response_length).to(idx.device)
 
-        if self.config.n > 1 and do_sample:
-            idx = idx.repeat_interleave(self.config.n, dim=0)
-            attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
-            position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
-            batch_size = batch_size * self.config.n
+        # Native vLLM n>1 returns ``batch_size * n`` responses. The prompt-side
+        # tensors must be expanded with the same order so downstream code keeps
+        # a one-row-per-sample invariant.
+        if sample_count > 1 and do_sample:
+            idx = idx.repeat_interleave(sample_count, dim=0)
+            attention_mask = attention_mask.repeat_interleave(sample_count, dim=0)
+            position_ids = position_ids.repeat_interleave(sample_count, dim=0)
+            batch_size = batch_size * sample_count
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)

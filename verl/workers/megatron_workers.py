@@ -351,7 +351,7 @@ class ActorRolloutRefWorker(MegatronWorker):
         return output
 
     @register(dispatch_mode=Dispatch.MEGATRON_PP_AS_DP_PROTO)
-    def generate_sequences(self, prompts: DataProto):
+    def generate_sequences(self, prompts: DataProto, sampling_kwargs=None):
         assert self._is_rollout
 
         prompts.batch = prompts.batch.cuda()
@@ -368,7 +368,8 @@ class ActorRolloutRefWorker(MegatronWorker):
             log_gpu_memory_usage('After entering sharding manager', logger=logger)
 
             prompts = self.sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            rollout_kwargs = sampling_kwargs or {}
+            output = self.rollout.generate_sequences(prompts=prompts, **rollout_kwargs)
 
             log_gpu_memory_usage('After rollout generation', logger=logger)
 

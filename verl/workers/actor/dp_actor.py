@@ -16,7 +16,7 @@ Single Process Actor
 """
 
 import itertools
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -34,6 +34,110 @@ import verl.utils.torch_functional as verl_F
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
 __all__ = ['DataParallelPPOActor']
+
+
+def _multi_advantage_enabled(config) -> bool:
+    """Return whether section-wise PPO losses should be used."""
+    return bool(config.get("multi_advantage", {}).get("enabled", False))
+
+
+def _compute_section_policy_loss(
+    *,
+    config,
+    data,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    turns_mask: Optional[torch.Tensor],
+):
+    """
+    Compute a sum of section-wise PPO losses.
+
+    Each section keeps its own mask and advantage tensor. The final actor loss is
+    the sum of these section losses, which is exactly the intended "train each
+    section separately, but on the same policy network" behavior.
+    """
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get("clip_ratio_c", 3.0)
+    loss_agg_mode = config.loss_agg_mode
+
+    total_pg_loss = torch.zeros((), device=log_prob.device)
+    total_clipfrac = torch.zeros((), device=log_prob.device)
+    total_ppo_kl = torch.zeros((), device=log_prob.device)
+    total_clipfrac_lower = torch.zeros((), device=log_prob.device)
+    section_count = 0
+    metrics = {}
+
+    for section in ("design", "code", "predict"):
+        adv_key = f"{section}_advantages"
+        mask_key = f"{section}_mask"
+        if adv_key not in data.keys() or mask_key not in data.keys():
+            continue
+
+        section_advantages = data[adv_key]
+        section_mask = data[mask_key].bool()
+        if not section_mask.any():
+            continue
+
+        if config.policy_loss == 'gspo':
+            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = core_algos.compute_policy_loss_GSPO(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=section_advantages,
+                response_mask=section_mask,
+                cliprange=clip_ratio,
+                cliprange_low=clip_ratio_low,
+                cliprange_high=clip_ratio_high,
+                clip_ratio_c=clip_ratio_c,
+                loss_agg_mode=loss_agg_mode,
+            )
+        elif config.policy_loss == 'turn':
+            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = core_algos.compute_policy_loss_turn(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=section_advantages,
+                response_mask=section_mask,
+                turns_mask=turns_mask,
+                cliprange=clip_ratio,
+                cliprange_low=clip_ratio_low,
+                cliprange_high=clip_ratio_high,
+                clip_ratio_c=clip_ratio_c,
+                loss_agg_mode=loss_agg_mode,
+            )
+        else:
+            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = core_algos.compute_policy_loss_dual_clip(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=section_advantages,
+                response_mask=section_mask,
+                cliprange=clip_ratio,
+                cliprange_low=clip_ratio_low,
+                cliprange_high=clip_ratio_high,
+                clip_ratio_c=clip_ratio_c,
+                loss_agg_mode=loss_agg_mode,
+            )
+
+        total_pg_loss = total_pg_loss + pg_loss
+        total_clipfrac = total_clipfrac + pg_clipfrac
+        total_ppo_kl = total_ppo_kl + ppo_kl
+        total_clipfrac_lower = total_clipfrac_lower + pg_clipfrac_lower
+        section_count += 1
+
+        metrics[f'actor/pg_loss_{section}'] = pg_loss.detach().item()
+        metrics[f'actor/pg_clipfrac_{section}'] = pg_clipfrac.detach().item()
+        metrics[f'actor/ppo_kl_{section}'] = ppo_kl.detach().item()
+
+    if section_count == 0:
+        raise ValueError("Multi-advantage mode is enabled, but no section masks / advantages were found.")
+
+    return (
+        total_pg_loss,
+        total_clipfrac / section_count,
+        total_ppo_kl / section_count,
+        total_clipfrac_lower / section_count,
+        metrics,
+    )
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -247,12 +351,23 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
 
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
-        if self.config.state_masking:
+        if self.config.state_masking or _multi_advantage_enabled(self.config):
             select_keys.append('loss_mask')
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         if self.config.policy_loss == 'turn':
             select_keys.append('turns_mask')
+        if _multi_advantage_enabled(self.config):
+            for key in (
+                'design_mask',
+                'code_mask',
+                'predict_mask',
+                'design_advantages',
+                'code_advantages',
+                'predict_advantages',
+            ):
+                if key in data.batch.keys():
+                    select_keys.append(key)
         batch = data.select(batch_keys=select_keys).batch
 
         # Split to make minibatch iterator for updating the actor
@@ -278,12 +393,14 @@ class DataParallelPPOActor(BasePPOActor):
                 response_length = responses.size(1)
                 attention_mask = data['attention_mask']
                 response_mask = attention_mask[:, -response_length:]
-                if self.config.state_masking:
+                if self.config.state_masking or _multi_advantage_enabled(self.config):
                     response_mask = data['loss_mask']
                 old_log_prob = data['old_log_probs']
                 advantages = data['advantages']
                 if self.config.policy_loss == 'turn':
                     turns_mask = data['turns_mask']
+                else:
+                    turns_mask = None
 
                 clip_ratio = self.config.clip_ratio
                 clip_ratio_low = (
@@ -299,7 +416,16 @@ class DataParallelPPOActor(BasePPOActor):
                 # all return: (bsz, response_length)
                 entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
-                if self.config.policy_loss == 'gspo':
+                extra_metrics = {}
+                if _multi_advantage_enabled(self.config):
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, extra_metrics = _compute_section_policy_loss(
+                        config=self.config,
+                        data=data,
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        turns_mask=turns_mask,
+                    )
+                elif self.config.policy_loss == 'gspo':
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = core_algos.compute_policy_loss_GSPO(old_log_prob=old_log_prob,
                                                                                             log_prob=log_prob,
                                                                                             advantages=advantages,
@@ -362,6 +488,8 @@ class DataParallelPPOActor(BasePPOActor):
                     'actor/ppo_kl': ppo_kl.detach().item(),
                 }
                 append_to_dict(metrics, data)
+                if extra_metrics:
+                    append_to_dict(metrics, extra_metrics)
 
             grad_norm = self._optimizer_step()
             data = {'actor/grad_norm': grad_norm.detach().item()}
