@@ -65,7 +65,7 @@ class KernelTrainSampleExporter:
             "tree_uid": np.array([sample.tree_uid for sample in samples], dtype=object),
             "node_uid": np.array([sample.node_uid for sample in samples], dtype=object),
             "parent_uid": np.array([sample.parent_uid for sample in samples], dtype=object),
-            "depth": np.array([sample.depth for sample in samples], dtype=np.int64),
+            "depth": np.array([sample.depth for sample in samples], dtype=object),
         }
         batch = TensorDict(source=tensors, batch_size=(len(samples),))
         return DataProto(batch=batch, non_tensor_batch=non_tensors)

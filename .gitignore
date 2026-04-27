@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Logs
+*.log
+*.jsonl
+
+# Scorer outputs
+tmp_kernel_scorer_logs/
+kernel_scorer_logs/
+
+# Training artifacts
+checkpoints/
+experiments/
+
+# Claude Code (local only)
+.claude/

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict
 
 from verl.utils.dataset.rl_dataset import RLHFDataset
@@ -56,8 +57,18 @@ class KernelRLDataset(RLHFDataset):
         row_dict["input_ids"] = input_ids[0]
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
-        row_dict["task_spec"] = row_dict.get(self.task_spec_key, {})
-        row_dict["bench_spec"] = row_dict.get(self.bench_spec_key, {})
+        row_dict["task_spec"] = _parse_json_field(row_dict.get(self.task_spec_key, {}))
+        row_dict["bench_spec"] = _parse_json_field(row_dict.get(self.bench_spec_key, {}))
         row_dict["reference_python"] = row_dict.get(self.reference_python_key, "")
         row_dict["index"] = row_dict.get("extra_info", {}).get("index", row_dict.get("index", item))
         return row_dict
+
+
+def _parse_json_field(value: Any) -> Dict[str, Any]:
+    """Parse a JSON string field from parquet into a dict, or pass through."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return value if isinstance(value, dict) else {}
