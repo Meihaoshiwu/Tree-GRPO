@@ -254,7 +254,8 @@ bash scripts/kernel_rl/run_e2e.sh
 ## 当前分支与提交历史
 
 ```
-7f7ec88 update smoke_parser_exporter (二叉树 + prompt累积 + 日志输出)
+28cc40b Phase 2: quality fixes for RL training readiness (prompt rules, tree logs, scorer, SFT pipeline)
+6f09144 feat: SFT dataset + Qwen 3B + binary tree E2E + JSON parsing + scorer sections
 8f87971 Add kernel PPO trainer entrypoint and config (+ smoke_scorer)
 d4a3d6a Enable native vLLM branching and multi-advantage actor loss (+ smoke_advantage)
 4e177dc Add kernel tree data model and smoke scripts
