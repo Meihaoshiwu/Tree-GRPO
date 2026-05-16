@@ -12,7 +12,7 @@ data:
   max_response_length: 1024
   max_start_length: 1024
   max_obs_length: 1024
-  train_batch_size: 2
+  train_batch_size: 4
   val_batch_size: 2
   return_raw_input_ids: False
   return_raw_chat: False
@@ -22,7 +22,7 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   model:
-    path: /inspire/qb-ilm/project/wuliqifa/public/sdt/models/Qwen2.5-Coder-3B-Instruct
+    path: /inspire/qb-ilm/project/wuliqifa/public/sdt/models/Qwen2.5-Coder-7B-Instruct-SFT-kernel-v2/checkpoint-500
     external_lib: null
     override_config: {}
     enable_gradient_checkpointing: False
@@ -32,10 +32,10 @@ actor_rollout_ref:
     policy_loss: dual_clip
     ppo_mini_batch_size: 16
     ppo_micro_batch_size: 4
-    ppo_mini_batch_size_fixed: null
-    ppo_micro_batch_size_fixed: null
+    ppo_mini_batch_size_fixed: 16
+    ppo_micro_batch_size_fixed: 4
     use_dynamic_bsz: False
-    ppo_max_token_len_per_gpu: 16384
+    ppo_max_token_len_per_gpu: 8192
     grad_clip: 1.0
     state_masking: False
     clip_ratio: 0.2
@@ -77,7 +77,7 @@ actor_rollout_ref:
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
   rollout:
     name: vllm
-    temperature: 1.0
+    temperature: 0.6
     top_k: -1
     top_p: 0.95
     prompt_length: ${data.max_prompt_length}
@@ -86,11 +86,13 @@ actor_rollout_ref:
     gpu_memory_utilization: 0.6
     ignore_eos: False
     enforce_eager: True
+    disable_log_stats: True
+    enable_chunked_prefill: False
     free_cache_engine: True
     load_format: auto
     tensor_model_parallel_size: 1
-    max_num_batched_tokens: 8192
-    max_num_seqs: 64
+    max_num_batched_tokens: 4096
+    max_num_seqs: 32
     log_prob_micro_batch_size: 16
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
@@ -125,7 +127,7 @@ critic:
   ppo_micro_batch_size: 4
   forward_micro_batch_size: ${critic.ppo_micro_batch_size}
   use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
-  ppo_max_token_len_per_gpu: 16384
+  ppo_max_token_len_per_gpu: 8192
   forward_max_token_len_per_gpu: ${critic.ppo_max_token_len_per_gpu}
   ulysses_sequence_parallel_size: 1
   ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
@@ -152,18 +154,19 @@ algorithm:
 kernel:
   max_depth: 2
   branch_factors: [2, 2]
-  keep_per_depth: [2, 4]
+  keep_per_depth: [4, 4]
   scorer:
-    mode: log_only
+    mode: eval
     num_workers: 2
     timeout_s: 300
-    log_dir: ./kernel_scorer_logs
+    log_dir: ./outputs/kernel_scorer_logs
+  tree_log_dir: ./outputs/kernel_tree_logs
 
 trainer:
   total_epochs: 1
   total_training_steps: 1
   project_name: verl_kernel
-  experiment_name: qwen25_coder_3b_tree_kernel
+  experiment_name: qwen25_coder_7b_tree_kernel
   logger: ['console']
   nnodes: 1
   n_gpus_per_node: 4
@@ -171,7 +174,7 @@ trainer:
   test_freq: -1
   critic_warmup: 0
   default_hdfs_dir: ~/experiments/kernel_rl/${trainer.experiment_name}
-  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_local_dir: /tmp/kernel_rl_checkpoints/${trainer.project_name}/${trainer.experiment_name}
 
 max_turns: 1
 do_search: false

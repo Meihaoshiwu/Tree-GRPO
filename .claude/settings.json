@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "TaskCreate",
+      "TaskUpdate",
+      "TaskList",
+      "TaskGet",
+      "TaskStop",
+      "TaskOutput",
+      "Agent(*:*)",
+      "WebFetch(*)",
+      "WebSearch(*)",
+      "Monitor(*)",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "ScheduleWakeup",
+      "NotebookEdit",
+      "EnterPlanMode",
+      "ExitPlanMode",
+      "Skill(*:*)"
+    ],
+    "deny": [
+      "Bash(git:push*)",
+      "Bash(git:remote*)",
+      "Bash(*>.git/*)",
+      "Bash(* .git/*)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+      "Bash(> /dev/*)"
+    ]
+  }
+}

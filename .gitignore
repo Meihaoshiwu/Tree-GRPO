@@ -9,12 +9,22 @@ __pycache__/
 *.jsonl
 
 # Scorer outputs
+outputs/
 tmp_kernel_scorer_logs/
 kernel_scorer_logs/
+kernel_tree_logs/
 
 # Training artifacts
 checkpoints/
 experiments/
 
-# Claude Code (local only)
-.claude/
+# Claude Code session files (local only)
+.claude/sessions/
+.claude/plans/
+.claude/backups/
+.claude/cache/
+.claude/debug/
+.claude/file-history/
+.claude/shell-snapshots/
+.claude/telemetry/
+.claude/tasks/

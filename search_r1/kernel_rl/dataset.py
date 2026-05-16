@@ -57,10 +57,16 @@ class KernelRLDataset(RLHFDataset):
         row_dict["input_ids"] = input_ids[0]
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
-        row_dict["task_spec"] = _parse_json_field(row_dict.get(self.task_spec_key, {}))
+        task_spec = _parse_json_field(row_dict.get(self.task_spec_key, {}))
+        reference_python = row_dict.get(self.reference_python_key, "")
+        # Inject reference_python into task_spec so the scorer can find it
+        if reference_python and isinstance(task_spec, dict):
+            task_spec["reference_python"] = reference_python
+        row_dict["task_spec"] = task_spec
         row_dict["bench_spec"] = _parse_json_field(row_dict.get(self.bench_spec_key, {}))
-        row_dict["reference_python"] = row_dict.get(self.reference_python_key, "")
-        row_dict["index"] = row_dict.get("extra_info", {}).get("index", row_dict.get("index", item))
+        row_dict["reference_python"] = reference_python
+        extra_info = _parse_json_field(row_dict.get("extra_info", {}))
+        row_dict["index"] = extra_info.get("index", row_dict.get("index", item))
         return row_dict
 
 

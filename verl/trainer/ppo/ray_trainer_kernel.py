@@ -37,10 +37,12 @@ class RayKernelPPOTrainer(LegacyRayPPOTrainer):
         *args,
         scoring_pool: KernelScoringPool,
         prompt_builder: Optional[KernelPromptBuilder] = None,
+        tree_log_dir: Optional[str] = None,
         **kwargs,
     ):
         self.scoring_pool = scoring_pool
         self.prompt_builder = prompt_builder or KernelPromptBuilder()
+        self.tree_log_dir = tree_log_dir or "./kernel_tree_logs"
         super().__init__(*args, **kwargs)
 
     def _create_dataloader(self):
@@ -166,6 +168,7 @@ class RayKernelPPOTrainer(LegacyRayPPOTrainer):
             config=tree_config,
             scoring_pool=self.scoring_pool,
             prompt_builder=self.prompt_builder,
+            tree_log_dir=self.tree_log_dir,
         )
 
     def fit(self):

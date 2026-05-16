@@ -562,6 +562,8 @@ class ActorRolloutRefWorker(Worker):
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             rollout_kwargs = sampling_kwargs or {}
+            if "n" not in rollout_kwargs:
+                rollout_kwargs["n"] = prompts.meta_info.get("n", 1)
             output = self.rollout.generate_sequences(prompts=prompts, **rollout_kwargs)
 
             log_gpu_memory_usage('After rollout generation', logger=logger)

@@ -21,10 +21,12 @@
 │  ├─ 原生 n>1 多分支采样（不重复 prompt）                      │
 │  └─ 返回 response_ids → ①                                   │
 │                                                            │
-│  ③ Scorer 评分进程 (CPU, Ray actor)                         │
+│  ③ Scorer 评分进程 (GPU, Ray actor)                          │
 │  ├─ 接收 KernelScoreRequest (node_uid, code_text, ...)     │
-│  ├─ Phase1: log_only, 写入 JSONL 日志                       │
-│  ├─ Phase2+: 子进程执行 benchmark/compile/runtime           │
+│  ├─ Step1: subprocess 编译检测 (crash 隔离)                  │
+│  ├─ Step2: N 次随机输入正确性验证 (torch.allclose)           │
+│  ├─ Step3: CUDA event 性能测量 (speedup vs PyTorch)         │
+│  ├─ (可选) SM 级采样: NSight Compute 硬件指标                │
 │  └─ 返回 KernelScoreResult (feedback, scalar_rewards) → ①   │
 │                                                            │
 │  ① 主训练循环进程 (CPU, trainer 进程)                        │
@@ -68,11 +70,31 @@
 | `schema.py` | `KernelTreeNode`（稀疏树状态）、`KernelTrainSample`（dense PPO 样本）、`ParsedKernelResponse`、`KernelScoreResult` |
 | `prompt_builder.py` | 构造 root/child prompt，强制 `design/code/predict` 三 section 输出 |
 | `parser.py` | 解析 `<design>/<code>/<predict>` 标签，计算 char/token span，生成 section mask |
-| `scorer.py` | `KernelScoringWorker` Ray actor + `KernelScoringPool`，phase1 仅 log-only |
+| `scorer.py` | `KernelScoringWorker` Ray actor + `KernelScoringPool`，调用 `scoring/` 模块执行真实评测 |
 | `exporter.py` | 树节点 → PPO batch，每个非根节点导出一个独立样本 |
 | `advantage.py` | Section-wise advantage：`design/code/predict` 分别算 advantage |
 | `dataset.py` | Kernel dataset，支持 `task_spec/bench_spec/reference_python`，自动解析 JSON 字段 |
-| `tree_manager.py` | Level-wise tree rollout manager，vLLM 原生 `n>1`，BFS 逐层推理 |
+| `tree_manager.py` | Level-wise tree rollout manager，vLLM 原生 `n>1`，BFS 逐层推理，按树输出层级日志 |
+
+### `search_r1/kernel_rl/scoring/` — Kernel 评分模块（独立目录）
+
+基于 KernelBench (ICML'25, ScalingIntelligence) 评测框架改造，三步流水线：
+
+| 文件 | 作用 |
+|------|------|
+| `__init__.py` | 导出 `KernelEvaluator`, `EvalConfig`, `EvalResult` |
+| `evaluator.py` | **主评测器**：编译(subprocess) → 正确性(N 次随机输入) → 性能(CUDA event + speedup)。`compute_rewards()` 和 `build_feedback()` 方法 |
+| `compiler.py` | Triton 编译检测，subprocess 隔离（crash 不杀 actor），tempfile + importlib 加载（`@triton.jit` 不支持 exec()） |
+| `correctness.py` | 数值正确性验证：N 次随机输入 `torch.allclose()` vs PyTorch 参考实现，支持 shape/value/runtime 错误分类 |
+| `benchmark.py` | 性能测量：CUDA event 计时，L2 cache 清理，speedup = ref_runtime / kernel_runtime |
+| `profiler.py` | SM 级性能采样（可选，需 NVIDIA Nsight Compute）：SM cycles, memory bandwidth, Tensor Core 利用率等硬件指标 |
+
+**评分信号设计**（参考 TritonForge）：
+```python
+reward_code    = 0.3 * compiled + 0.4 * correct + 0.3 * min(speedup, cap) / cap
+reward_design  = 0.3 * min(speedup, cap) / cap      # 仅正确时给分
+reward_predict = 0.3 * min(speedup, cap) / cap      # 仅正确时给分
+```
 
 ### 新增 Trainer 文件
 
@@ -129,8 +151,50 @@
 
 ### 训练样本
 - `KernelTreeNode`：稀疏 rollout 状态，不存 dense token advantage
-- `KernelTrainSample`：dense PPO 实体，含 `loss_mask`、`design/code/predict_mask`、section token scores
-- 每个非根节点导出一个独立 PPO sample
+- `KernelTrainSample`：dense PPO 实体，每个非根节点导出一个独立 PPO sample
+- 端到端训练1步仅用于验证数据链路，后续再开启完整训练
+
+### PPO Sample 组成
+
+每个 `KernelTrainSample`（即 exporter 导出的一个训练样本）包含：
+
+```
+┌─ 模型输入 ─────────────────────────────────────────────┐
+│  input_ids         = cat([prompt_ids, response_ids])    │  ← 完整 token 序列
+│  attention_mask    = cat([prompt_attn, response_attn])  │
+│  position_ids      = 从 prompt 末位连续编号               │
+│  responses         = response_ids                       │  ← 仅新增生成部分
+├─ 训练目标 ─────────────────────────────────────────────┤
+│  loss_mask         = OR(design_mask, code_mask, predict_mask) │  ← 哪些 token 参与 loss
+│  design_mask       = parser 标记的 design token 位置     │
+│  code_mask         = parser 标记的 code token 位置       │
+│  predict_mask      = parser 标记的 predict token 位置    │
+├─ Token 级评分 ─────────────────────────────────────────┤
+│  design_token_scores  = design_mask × scalar_design_reward   │
+│  code_token_scores    = code_mask × scalar_code_reward       │
+│  predict_token_scores = predict_mask × scalar_predict_reward │
+│  token_level_scores   = 三路求和                             │
+├─ Advantage (由 advantage.py 计算后加入) ────────────────│
+│  design_advantages  / code_advantages  / predict_advantages │
+│  advantages (三路合并，兼容旧训练栈)                         │
+│  returns (GAE returns，no_estimator 时=scores)               │
+├─ 元数据 (non_tensor) ──────────────────────────────────│
+│  uid / tree_uid / node_uid / parent_uid / depth         │
+└────────────────────────────────────────────────────────┘
+```
+
+**构建流程**：
+```
+scorer返回 scalar_rewards → _attach_score_result → node.scalar_design/code/predict_reward
+    → exporter._build_sample()
+        → section_mask × scalar_reward → token_level_scores
+        → cat(prompt_ids, response_ids) → input_ids
+    → fit() 中 compute_log_prob → old_log_probs
+    → fit() 中 compute_multi_section_advantages → design/code/predict_advantages
+    → fit() 中 wg.update_actor() → 梯度更新
+```
+
+**Fallback 机制**：当 parser 解析不出任何 section 时（模型不按格式输出），exporter 将所有有效 response token 视为 code section，避免 `loss_mask` 全零导致 loss=0 训练中断。
 
 ### Reward / Advantage
 - 节点级 scalar reward：`scalar_design/code/predict_reward`
@@ -138,8 +202,10 @@
 - Actor loss 三路分开算：`L = L_design + L_code + L_predict`
 
 ### Scorer
-- `KernelScoringWorker` Ray actor，phase1 仅 `log_only`
-- 预埋 subprocess helper，后续可执行 benchmark/compile/runtime
+- `KernelScoringWorker` Ray actor，默认 `mode: eval`
+- 三步评测流水线：编译(subprocess隔离) → 正确性(N次随机输入) → 性能(CUDA event + speedup)
+- `log_only` 模式保留用于调试（不执行真实 benchmark）
+- SM 级性能采样通过 `scoring/profiler.py` 可选扩展（需 ncu）
 
 ## 模型
 
@@ -164,7 +230,20 @@ Qwen2.5-Coder-3B-Instruct，路径：`/inspire/qb-ilm/project/wuliqifa/public/sd
 python scripts/kernel_rl/smoke_parser_exporter.py   # parser + exporter + prompt builder（二叉树）
 python scripts/kernel_rl/smoke_advantage.py          # section-wise advantage（4/4 PASS）
 python scripts/kernel_rl/smoke_scorer.py             # scorer actor（PID + JSONL）
+python scripts/kernel_rl/smoke_scoring.py            # 评分模块：编译+正确性+性能（6/6 PASS，需 GPU）
 ```
+
+### SFT 数据生成
+```bash
+# 从 KernelBook 生成 800 条三段式 SFT 数据（含 auto-generated design/predict）
+python scripts/kernel_rl/gen_sft_data_v2.py --num_samples 800 --output data/kernel_rl/sft_train_v2.jsonl
+```
+
+### SFT 训练（需要 4×GPU，全量微调）
+```bash
+bash scripts/kernel_rl/run_sft.sh
+```
+预期：800 样例，5 epochs，~500 步，~40 分钟。输出到 `models/Qwen2.5-Coder-7B-Instruct-SFT-kernel-v2/`
 
 ### 端到端验证（需要 GPU，二叉树 depth=2）
 ```bash
@@ -181,11 +260,103 @@ d4a3d6a Enable native vLLM branching and multi-advantage actor loss (+ smoke_adv
 4e177dc Add kernel tree data model and smoke scripts
 ```
 
-## 当前状态与已知限制
+## 当前状态
 
-- 三个冒烟测试全部通过，数据结构通路验证完毕
-- 端到端脚本已就绪，待 GPU 执行验证
-- scorer 仅 log_only，未执行真实 benchmark
-- validation 为 placeholder
-- `algorithm.kernel_adv_estimator` 为 `no_estimator`，后续可切 `grpo`
-- Git author: Sdt <sdt@local>
+### 已完成
+- ✅ SFT 训练（800 KernelBook 样例, 5 epochs, avg loss 0.09, ~75min, 4×GPU FSDP）
+- ✅ SFT 模型格式验证：未见任务上 100% 输出三段式 + 有效 Triton 代码
+- ✅ RL 端到端链路确认打通（vLLM → tree rollout → scorer → advantage → PPO update）
+- ✅ 评分模块：编译 + 正确性 + 性能，subprocess 隔离，reward 三段可配置
+- ✅ vLLM KV cache 内存分析文档：`docs/vllm_kvcache_memory.md`
+- ✅ 输出目录重定向到 `/tmp`（GPFS 配额仅 368MB，全组共享）
+- 模型：`models/Qwen2.5-Coder-7B-Instruct-SFT-kernel-v2/checkpoint-500/`
+
+### 已修复的关键阻塞问题
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| E2E 卡在 Ray init | GPFS overlay quota 写满 | Hydra/checkpoint/log 重定向到 `/tmp` |
+| GPU 调度死锁 | scorer `num_gpus=0.2` 碎片化 GPU0，veRL 4×STRICT_PACK 永远等不到 | scorer `num_gpus=0.0` |
+| response_length=1 | SFT 用 chat template 训练，但 tree_manager 发裸 prompt 给 vLLM | `_build_prompt_batch` 包裹 `apply_chat_template(add_generation_prompt=True)` |
+| vLLM KV cache OOM | 7B 模型需更多显存 | `gpu_memory_utilization=0.6`, `ppo_max_token_len=8192` |
+
+### 当前 RL 链路状态（已验证）
+```
+SFT Model → chat template prompt → vLLM 生成 ~962 tokens → parser 三段
+→ scorer 编译+正确性+性能 → reward (max=194) → advantage (max=0.3)
+→ pg_loss_code=-0.3 → FSDP gradient → grad_norm=0.133
+```
+- `response_length/mean`: 961.6（从 1.0 修复后）
+- `critic/rewards/mean`: 78.0, max: 194.1
+- `actor/pg_loss_code`: -0.30（非零训练信号）
+- 三段 loss 均计算：`pg_loss_design`, `pg_loss_code`, `pg_loss_predict`
+
+### 已知限制
+- Design 和 predict 的 reward 目前与 code 同向（`scoring/reward.py`），需独立设计
+- 种子任务仅 6 个（`train.parquet`），需扩展到 KernelBench Level 1 规模
+- GRPO advantage estimator 未启用（当前 `no_estimator` = 原始 scores）
+- 训练仅 1 步验证，未做多步 RL
+- SFT 模型输出含 `torch._inductor` 模板代码（KernelBook 数据特征），需 RL 优化去掉
+
+## 下一步：Phase 2 真实 RL 训练
+
+### 目标
+写出至少比 `torch.compile` 性能更高的 Triton 算子，在 KernelBench Level 1 上验证。
+
+### 需要的工作
+
+**1. 种子任务扩展**
+- 从 KernelBench Level 1（100 问题）精选 20-30 个适合 Triton 的问题
+- 每个任务格式：`task_spec(reference_python, ...)` + `bench_spec(input_gen, target_speedup, ...)`
+- 确保 `input_gen` 参数签名与 `reference_python` 一致
+
+**2. Reward 设计——代际差异 + 同深度节点对比**
+```
+当前 reward = 0.3*compile + 0.4*correct + 0.3*perf（三段同向）
+目标 reward:
+  - code:    compile + correctness + speedup（已有，保留）
+  - design:  [父节点 design 策略] 与 [子节点 code 实现] 的一致性
+             + design 中声称的 block_size 是否与 code 中实际的一致
+             + 同级节点间 design 多样性（鼓励探索）
+  - predict: |predicted_speedup - actual_speedup| / max(predicted, actual)
+             越接近实测值分越高
+```
+
+**3. 代际差异 reward（inter-generational）**
+- 子节点 speedup > 父节点 speedup → 正奖励（改进了）
+- 子节点 speedup < 父节点 speedup → 负奖励（退步了）
+- 基于 tree 结构自然获得：child.speedup - parent.speedup
+
+**4. GRPO 同深度对比**
+- 启用 `adv_estimator: grpo`（替代 `no_estimator`）
+- 同一深度节点的 reward 相互对比，计算 group-wise advantage
+- 更平稳的训练：advantage 不再只看绝对值，而是看组内相对表现
+
+**5. 训练配置**
+- Multi-step RL（≥100 步），逐步提升
+- `adv_estimator: grpo`
+- 每步对比训练前后的 KernelBench 指标（compile rate, correctness rate, avg speedup）
+- 日志保留关键 metrics，不自动清理
+
+### 关键文件
+| 文件 | 需修改内容 |
+|------|------|
+| `data/kernel_rl/train.parquet` | 替换为 20-30 个 KernelBench 问题 |
+| `scoring/reward.py` | 新增 design-prediction 一致性 reward、代际差异 reward |
+| `verl/trainer/config/ppo_trainer_kernel.yaml` | `adv_estimator: grpo`、多步训练 |
+| `search_r1/kernel_rl/advantage.py` | 确认 GRPO 同深度节点组正确 |
+| `docs/vllm_kvcache_memory.md` | vLLM KV cache 分析文档 |
+
+## 存储说明
+- 代码、数据、模型权重：GPFS `/inspire/qb-ilm/project/wuliqifa/public/sdt/`（长期保留）
+- 训练输出（checkpoint、日志）：`/tmp/`（overlay，1.5TB，运行完需分析后清理）
+- GPFS 配额仅 368MB 剩余（全组 40+ 人共享），禁止写入大文件
+
+## Git 作者
+- sudetong <sudetong@local>
+
+## 本地开发规则
+
+- **永远不推送到远程仓库**，只做本地 `git commit`
+- 提交由用户手动完成，Claude 仅做本地 commit（不 push）
+- 危险操作（`rm -rf`、`git push`、`git reset --hard`）已被 `.claude/settings.json` 拦截
+- 常规开发操作（python、git 本地、文件读写）无需重复确认，已加入 allowlist

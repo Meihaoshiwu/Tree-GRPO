@@ -94,6 +94,7 @@ def main_task(config):
         val_reward_fn=None,
         scoring_pool=scoring_pool,
         prompt_builder=KernelPromptBuilder(),
+        tree_log_dir=config.kernel.get("tree_log_dir", "./kernel_tree_logs"),
     )
     print(f"=================init_workers================")
     trainer.init_workers()

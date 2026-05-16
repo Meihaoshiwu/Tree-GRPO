@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -19,13 +21,6 @@ from .schema import KernelScoreResult, KernelTreeNode
 
 @dataclass
 class KernelTreeSearchConfig:
-    """
-    Config for true level-wise tree rollout.
-
-    ``max_depth`` follows the user-facing tree depth convention:
-    root depth is 0, and the deepest generated nodes are at ``max_depth``.
-    """
-
     max_depth: int
     branch_factors: Sequence[int]
     keep_per_depth: Sequence[int]
@@ -35,25 +30,18 @@ class KernelTreeSearchConfig:
     prune_strategy: str = "reward_desc_then_fifo"
 
     def branch_factor_for_parent_depth(self, parent_depth: int) -> int:
-        """Return how many children each active node should sample."""
         if parent_depth < len(self.branch_factors):
             return int(self.branch_factors[parent_depth])
         return int(self.branch_factors[-1])
 
     def keep_count_for_child_depth(self, child_depth: int) -> int:
-        """Return how many nodes remain active after one level is expanded."""
         if child_depth - 1 < len(self.keep_per_depth):
             return int(self.keep_per_depth[child_depth - 1])
         return int(self.keep_per_depth[-1])
 
 
 class KernelTreeSearchManager:
-    """
-    Level-wise tree rollout manager for kernel-development tasks.
-
-    Each depth is rolled out as one batched vLLM step. Native ``n > 1`` sampling
-    is used for multi-branch generation instead of duplicating prompts by hand.
-    """
+    """Level-wise tree rollout manager for kernel-development tasks."""
 
     def __init__(
         self,
@@ -64,6 +52,7 @@ class KernelTreeSearchManager:
         prompt_builder: Optional[KernelPromptBuilder] = None,
         output_parser: Optional[KernelOutputParser] = None,
         exporter: Optional[KernelTrainSampleExporter] = None,
+        tree_log_dir: Optional[str] = None,
     ):
         self.tokenizer = tokenizer
         self.actor_rollout_wg = actor_rollout_wg
@@ -72,15 +61,14 @@ class KernelTreeSearchManager:
         self.prompt_builder = prompt_builder or KernelPromptBuilder()
         self.output_parser = output_parser or KernelOutputParser()
         self.exporter = exporter or KernelTrainSampleExporter(parser=self.output_parser)
+        self.tree_log_dir = tree_log_dir or "./kernel_tree_logs"
+        os.makedirs(self.tree_log_dir, exist_ok=True)
 
+        # Per-run counter for intra-level node indices
+        self._level_counters: Dict[int, int] = {}
+
+    # ------------------------------------------------------------------
     def run_tree_rollout(self, batch: DataProto) -> Tuple[List[KernelTreeNode], DataProto]:
-        """
-        Run the full tree rollout and export node-level PPO samples.
-
-        Returns:
-            roots: the sparse tree for logging / debugging.
-            train_batch: dense PPO samples exported from every generated node.
-        """
         roots = self._build_root_nodes(batch)
         active_nodes = roots
 
@@ -93,9 +81,9 @@ class KernelTreeSearchManager:
             if branch_factor <= 0:
                 break
 
+            prompt_batch.meta_info["n"] = branch_factor
             rollout_output = self.actor_rollout_wg.generate_sequences(
-                prompt_batch,
-                {"n": branch_factor},
+                prompts=prompt_batch,
             )
 
             new_children = self._materialize_children(
@@ -112,15 +100,35 @@ class KernelTreeSearchManager:
                 keep_count = self.config.keep_count_for_child_depth(parent_depth + 1)
                 active_nodes = self._select_active_children(new_children, keep_count=keep_count)
 
+        # Write per-tree hierarchy log
+        self._write_tree_logs(roots)
+
         train_batch = self.exporter.export_nodes(roots)
         return roots, train_batch
 
+    # ------------------------------------------------------------------
+    # Node naming
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_node_uid(depth: int, index: int) -> str:
+        """Hierarchical node identifier: ``d{depth}_n{index}``."""
+        return f"d{depth}_n{index}"
+
+    def _next_node_uid(self, depth: int) -> str:
+        idx = self._level_counters.get(depth, 0)
+        self._level_counters[depth] = idx + 1
+        return self._make_node_uid(depth, idx)
+
+    # ------------------------------------------------------------------
+    # Tree construction
+    # ------------------------------------------------------------------
+
     def _build_root_nodes(self, batch: DataProto) -> List[KernelTreeNode]:
-        """Build one synthetic root node per original training example."""
         roots: List[KernelTreeNode] = []
         for idx in range(len(batch)):
             data_item = batch[idx]
-            tree_uid = str(data_item.non_tensor_batch.get("index", idx))
+            tree_uid = str(data_item.non_tensor_batch.get("index", f"kernel_{idx}"))
             prompt_text = data_item.non_tensor_batch.get("prompt_text")
             if not prompt_text:
                 prompt_ids = data_item.batch["input_ids"]
@@ -131,7 +139,7 @@ class KernelTreeSearchManager:
             roots.append(
                 KernelTreeNode(
                     tree_uid=tree_uid,
-                    node_uid=f"root-{uuid.uuid4()}",
+                    node_uid=self._next_node_uid(0),
                     parent_uid=None,
                     depth=0,
                     task_spec=data_item.non_tensor_batch.get("task_spec", {}) or {},
@@ -149,12 +157,6 @@ class KernelTreeSearchManager:
         self,
         active_nodes: Sequence[KernelTreeNode],
     ) -> Tuple[DataProto, List[Dict[str, torch.Tensor]]]:
-        """
-        Build a batch of same-depth prompts for one vLLM generation step.
-
-        ``prompt_states`` mirrors the batch order and is later attached to the
-        generated children so that each child stores the exact prompt it used.
-        """
         prompt_ids_list = []
         prompt_attention_mask_list = []
         prompt_position_ids_list = []
@@ -162,8 +164,18 @@ class KernelTreeSearchManager:
 
         for node in active_nodes:
             prompt_text = self._build_prompt_for_expansion(node)
+
+            # Wrap in chat template so the SFT model sees <|im_start|>assistant\n
+            # and knows to generate the three-section response.
+            messages = [{"role": "user", "content": prompt_text}]
+            chat_prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
             prompt_ids, prompt_attention_mask = verl_F.tokenize_and_postprocess_data(
-                prompt=prompt_text,
+                prompt=chat_prompt,
                 tokenizer=self.tokenizer,
                 max_length=self.config.max_prompt_length,
                 pad_token_id=self.tokenizer.pad_token_id,
@@ -203,12 +215,6 @@ class KernelTreeSearchManager:
         return prompt_batch, prompt_states
 
     def _build_prompt_for_expansion(self, node: KernelTreeNode) -> str:
-        """
-        Build the next-round prompt for one active node.
-
-        Root nodes already own the original prompt. Non-root nodes must append
-        their previous output and environment feedback before the next rollout.
-        """
         if node.is_root:
             return node.prompt_text
         return self.prompt_builder.build_child_prompt(
@@ -226,7 +232,6 @@ class KernelTreeSearchManager:
         branch_factor: int,
         child_depth: int,
     ) -> List[KernelTreeNode]:
-        """Create child nodes from one batched rollout output."""
         requests: List[KernelScoreRequest] = []
         children: List[KernelTreeNode] = []
         prompt_length = prompt_states[0]["prompt_ids"].shape[-1]
@@ -247,7 +252,7 @@ class KernelTreeSearchManager:
 
             child = KernelTreeNode(
                 tree_uid=parent_node.tree_uid,
-                node_uid=str(uuid.uuid4()),
+                node_uid=self._next_node_uid(child_depth),
                 parent_uid=parent_node.node_uid,
                 depth=child_depth,
                 task_spec=parent_node.task_spec,
@@ -290,7 +295,6 @@ class KernelTreeSearchManager:
         return children
 
     def _attach_score_result(self, node: KernelTreeNode, score_result: KernelScoreResult) -> None:
-        """Store scorer output on the node in a field-by-field explicit way."""
         node.score_result = score_result
         node.status = score_result.status
         node.env_feedback_text = score_result.feedback_text
@@ -300,13 +304,59 @@ class KernelTreeSearchManager:
         node.scalar_predict_reward = score_result.get_reward("predict")
 
     def _select_active_children(self, children: List[KernelTreeNode], keep_count: int) -> List[KernelTreeNode]:
-        """
-        Keep the best children for the next depth.
-
-        Phase 1 uses a simple reward-descending heuristic. When scores are tied,
-        insertion order is preserved so the rollout stays deterministic.
-        """
         if keep_count <= 0 or keep_count >= len(children):
             return children
         ranked = sorted(children, key=lambda node: node.total_reward(), reverse=True)
         return ranked[:keep_count]
+
+    # ------------------------------------------------------------------
+    # Per-tree logging
+    # ------------------------------------------------------------------
+
+    def _write_tree_logs(self, roots: List[KernelTreeNode]) -> None:
+        """Write one directory per tree, one file per node, showing full prompt chain."""
+        for root in roots:
+            tree_dir = os.path.join(self.tree_log_dir, f"tree_{root.tree_uid}")
+            os.makedirs(tree_dir, exist_ok=True)
+            self._write_node_file(root, tree_dir)
+
+    def _write_node_file(self, node: KernelTreeNode, tree_dir: str) -> None:
+        path = os.path.join(tree_dir, f"{node.node_uid}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"=== NODE: {node.node_uid} ===\n")
+            f.write(f"=== TREE: {node.tree_uid} ===\n")
+            f.write(f"=== PARENT: {node.parent_uid or 'ROOT'} ===\n")
+            f.write(f"=== DEPTH: {node.depth} ===\n")
+            f.write(f"=== STATUS: {node.status} ===\n")
+            if not node.is_root:
+                f.write(f"=== REWARDS: design={node.scalar_design_reward:.3f} "
+                        f"code={node.scalar_code_reward:.3f} "
+                        f"predict={node.scalar_predict_reward:.3f} ===\n")
+            f.write("\n")
+
+            # Full prompt sent to model
+            f.write("--- PROMPT (sent to model) ---\n")
+            f.write(node.prompt_text)
+            f.write("\n\n")
+
+            # Model response
+            if node.response_text:
+                f.write("--- MODEL RESPONSE ---\n")
+                f.write(node.response_text)
+                f.write("\n\n")
+
+            # Scorer feedback
+            if node.env_feedback_text:
+                f.write("--- SCORER FEEDBACK ---\n")
+                f.write(node.env_feedback_text)
+                f.write("\n\n")
+
+            # Metrics
+            if node.metrics:
+                f.write("--- METRICS ---\n")
+                for k, v in sorted(node.metrics.items()):
+                    f.write(f"  {k}: {v}\n")
+                f.write("\n")
+
+        for child in node.children:
+            self._write_node_file(child, tree_dir)

@@ -37,6 +37,17 @@ from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 from vllm.distributed import parallel_state as vllm_ps
 from vllm import LLM, SamplingParams
+
+# Monkey-patch: vLLM 0.8.x calls all_special_tokens_extended which Qwen2Tokenizer
+# does not expose. Alias it to all_special_tokens until upstream fixes the issue.
+try:
+    from transformers import Qwen2Tokenizer
+    if not hasattr(Qwen2Tokenizer, "all_special_tokens_extended"):
+        Qwen2Tokenizer.all_special_tokens_extended = property(
+            lambda self: getattr(self, "all_special_tokens", [])
+        )
+except ImportError:
+    pass
 from verl.third_party.vllm import vllm_version
 
 # TODO

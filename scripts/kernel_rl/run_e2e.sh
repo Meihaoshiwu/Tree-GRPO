@@ -26,14 +26,17 @@ export NCCL_DEBUG=WARN
 export TOKENIZERS_PARALLELISM=true
 export RAY_memory_monitor_refresh_ms=0
 export RAY_DEDUP_LOGS=0
+export HYDRA_OUTPUT_DIR=/tmp/hydra_outputs
 
 echo ""
 echo "Starting kernel PPO trainer (Ray will auto-init)..."
 python -m verl.trainer.main_ppo_kernel \
-    --config verl/trainer/config/ppo_trainer_kernel.yaml \
+	    hydra.run.dir=./outputs/hydra/\${now:%Y-%m-%d_%H-%M-%S} \
     2>&1 | tee "$LOG_FILE"
 
 EXIT_CODE=${PIPESTATUS[0]}
+
+# Outputs preserved in ./outputs/ for review
 
 if [ $EXIT_CODE -eq 0 ]; then
     echo ""
