@@ -163,12 +163,19 @@ class KernelEvaluator:
         try:
             from .benchmark import measure_performance
 
+            # Use torch.compile for reference baseline (apples-to-apples)
+            try:
+                compiled_ref_fn = torch.compile(ref_fn, mode="reduce-overhead")
+                # Warmup torch.compile
+                _ = compiled_ref_fn(*[x.to(device=device, dtype=dtype) if isinstance(x, torch.Tensor) else x for x in input_gen()])
+            except Exception:
+                compiled_ref_fn = ref_fn  # fallback to eager if compile fails
+
             def _ref_closure():
                 torch.manual_seed(cfg.seed)
                 inp = input_gen()
                 torch.manual_seed(cfg.seed)
-                # ref_fn already wrapped with _to_device_fn, so pass raw inputs
-                return ref_fn(*inp)
+                return compiled_ref_fn(*inp)
 
             def _new_closure():
                 torch.manual_seed(cfg.seed)

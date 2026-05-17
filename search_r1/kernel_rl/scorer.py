@@ -45,19 +45,13 @@ class KernelScoreRequest:
 def _build_ref_code(task_spec: Dict[str, Any], bench_spec: Dict[str, Any]) -> str:
     """Build a ``simple``-format ref_code string from task/bench specs.
 
-    Produces::
-
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
-        import triton
-        import triton.language as tl
-
-        def ref_fn(...): ...
-        def gen_inputs(): return [<bench_spec.input_gen>]
+    Produces ref_fn + gen_inputs.  The scorer calls ref_fn via torch.compile
+    to get the baseline timing for speedup computation.
     """
     ref_python = task_spec.get("reference_python", "") or task_spec.get("reference_code", "")
     input_gen = bench_spec.get("input_gen", "torch.randn(4096)")
+    # Parse multiple inputs: "torch.randn(4096), torch.randn(4096)"
+    inputs = [x.strip() for x in input_gen.split(",")]
 
     lines = [
         "import torch",
@@ -72,9 +66,8 @@ def _build_ref_code(task_spec: Dict[str, Any], bench_spec: Dict[str, Any]) -> st
         lines.append(ref_python.strip())
         lines.append("")
 
-    # Wrap the input_gen expression into a gen_inputs function
     lines.append("def gen_inputs():")
-    lines.append(f"    return [{input_gen}]")
+    lines.append(f"    return [{', '.join(inputs)}]")
     lines.append("")
     return "\n".join(lines)
 
@@ -178,7 +171,15 @@ class KernelScoringWorker:
             self._log_result(request, result)
             return result
 
-        rewards = self.evaluator.compute_rewards(eval_result, target_speedup=target_speedup)
+        from .scoring.reward import compute_rewards as phase2_rewards
+        rewards = phase2_rewards(
+            result=eval_result,
+            design_text=request.design_text or "",
+            code_text=request.code_text or "",
+            predict_text=request.predict_text or "",
+            reference_python=request.task_spec.get("reference_python", ""),
+            target_speedup=target_speedup,
+        )
         feedback = self.evaluator.build_feedback(eval_result)
 
         metrics = {

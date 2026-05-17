@@ -141,8 +141,8 @@ reward_model:
 algorithm:
   gamma: 1.0
   lam: 1.0
-  adv_estimator: no_estimator
-  kernel_adv_estimator: no_estimator
+  adv_estimator: grpo
+  kernel_adv_estimator: grpo
   no_think_rl: False
   kl_penalty: kl
   use_kl_in_reward: False
