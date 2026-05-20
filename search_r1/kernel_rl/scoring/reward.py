@@ -47,16 +47,6 @@ def detect_python_cheating(code_text: str) -> bool:
     return False
 
 
-def is_too_short(code_text: str, reference_python: str) -> bool:
-    """Return True if code is suspiciously shorter than reference."""
-    code_lines = [l for l in code_text.split('\n')
-                  if l.strip() and not l.strip().startswith('#')]
-    ref_lines = [l for l in (reference_python or '').split('\n') if l.strip()]
-    if not ref_lines:
-        return len(code_lines) < 3
-    return len(code_lines) < len(ref_lines)
-
-
 # ══════════════════════════════════════════════════════════════════════
 # Code Reward — speedup-based S-curve
 # ══════════════════════════════════════════════════════════════════════
@@ -65,10 +55,11 @@ def code_reward(
     compiled: bool,
     correctness: bool,
     speedup: float,
+    correctness_ratio: float = 0.0,
     is_cheating: bool = False,
-    code_too_short: bool = False,
+    has_triton_jit: bool = True,
 ) -> float:
-    """Speedup-based S-curve. No penalty for mediocre code, two exceptions.
+    """Speedup-based S-curve + correctness proportion. No penalty for mediocre code.
 
     Penalty exceptions:
       1. is_cheating: compiled OK but calls PyTorch, never launches Triton → -0.3
@@ -83,7 +74,7 @@ def code_reward(
     if is_cheating:
         return -0.3
 
-    if not compiled and code_too_short:
+    if not compiled and not has_triton_jit:
         return -0.2
 
     # ── Effort path (compile failed but tried) ─────────────────────
@@ -94,17 +85,18 @@ def code_reward(
     if not correctness:
         return 0.15
 
-    # ── Compile OK + correct → speedup-based ──────────────────────
+    # ── Compile OK + correct → speedup-based + correctness proportion ──
     if speedup <= 0.5:
-        return 0.2
+        base = 0.2
     elif speedup < 0.8:
-        return 0.25
+        base = 0.25
     else:
-        # S-curve: flat below target, steep around midpoint, capped
         k = 4.0
         midpoint = 1.2
         sigmoid = 1.0 / (1.0 + math.exp(-k * (speedup - midpoint)))
-        return 0.3 + sigmoid * 0.4
+        base = 0.3 + sigmoid * 0.4
+    # Modest correctness proportion bonus (0-0.05)
+    return base + 0.05 * correctness_ratio
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -238,20 +230,25 @@ def compute_rewards(
     reference_python: str = "",
     target_speedup: float = 2.0,
 ) -> Dict[str, float]:
-    """Compute three independent section rewards from eval result.
+    """Compute three independent section rewards (Phase 2 design).
 
     Returns {"design": ..., "code": ..., "predict": ...}
     """
-    # Anti-cheat checks
+    # Anti-cheat: AST-based detection
     cheating = detect_python_cheating(code_text) if code_text else False
-    too_short = is_too_short(code_text, reference_python) if code_text else False
+    has_triton_jit = "@triton.jit" in (code_text or "")
+
+    # Correctness proportion
+    total_trials = max(result.num_correct_trials, 1)
+    correctness_ratio = result.num_passed_trials / total_trials if result.compiled else 0.0
 
     r_code = code_reward(
         compiled=result.compiled,
         correctness=result.correctness,
         speedup=result.speedup,
+        correctness_ratio=correctness_ratio,
         is_cheating=cheating,
-        code_too_short=too_short,
+        has_triton_jit=has_triton_jit,
     )
 
     r_design = design_reward(
@@ -260,6 +257,7 @@ def compute_rewards(
         speedup=result.speedup,
     )
 
+    # Predict: always active (three sections independent)
     r_predict = predict_reward(
         predict_text=predict_text,
         compiled=result.compiled,
