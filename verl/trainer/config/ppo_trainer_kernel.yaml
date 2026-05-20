@@ -22,7 +22,7 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   model:
-    path: /inspire/qb-ilm/project/wuliqifa/public/sdt/models/Qwen2.5-Coder-7B-Instruct-SFT-kernel-v2/checkpoint-500
+    path: /inspire/qb-ilm/project/wuliqifa/public/sdt/models/Qwen2.5-Coder-7B-Instruct-SFT-kernel-v3
     external_lib: null
     override_config: {}
     enable_gradient_checkpointing: False
