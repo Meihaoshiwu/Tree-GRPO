@@ -187,3 +187,108 @@ torch._inductor 是内部表示还是真实 Triton 代码？任何难度的 trit
 3. **Bootstrapping**——SFT 后用模型生成 KernelBench 100 题的候选，scorer 过滤，扩充数据集
 4. **GRPO + 绝对 baseline 保底**——实现 group_std < 阈值时回退到绝对 reward 对比
 5. **多步 RL**——≥100 步，观察 loss 下降和 code 质量变化
+
+---
+
+## 9. 第二轮讨论 (2026-05-18)
+
+### 9.1 "30%" 的含义澄清
+
+**用户理解正确**：30% 应该指 SFT 数据本身的编译通过率，不是 SFT 训练后的模型表现。SFT 训练数据应该尽可能 100% 编译通过。这个 30% 是我之前讨论 RL 基线时的一个粗略估计（SFT 训练后模型在新 prompt 上的编译通过率），并不是说 SFT 数据只包含 30% 能编译的代码。
+
+**真正的要求**：SFT 数据全部来自 **能编译+正确+性能好** 的 Triton 代码。获取方式：
+1. 人工手写的 Triton（triton-lang/kernels 等）
+2. 大模型生成 + 拒绝采样（scorer 过滤）
+
+### 9.2 可用的开源 Triton 代码资源
+
+除了 triton 官方 tutorial，还有：
+
+| 资源 | 描述 | 代码量 |
+|------|------|------|
+| `triton-lang/kernels` | 官方 benchmark kernels（matmul, flash attention, cross entropy） | 28 py files |
+| `FlagAlpha/OpenTritonKernel` | 社区 Triton kernel 集合 | ~50 kernels |
+| KernelBench L1/L2/L3 | 250 个 PyTorch 参考实现（需自己写 Triton 版本） | 250 problems |
+| vLLM kernels | 生产级 Triton kernels（attention, quantization, fused ops） | ~30 kernels |
+| `unsloth` | LLaMA fine-tuning Triton kernels | ~20 kernels |
+| `torchtune` | Meta 的 Triton kernels for LLM | ~15 kernels |
+| HuggingFace TGI | Flash attention, quantization kernels | ~20 kernels |
+
+**结论**：约 150+ 个人工手写的 Triton kernels 可以直接使用。每个 kernel 通过改变输入尺寸可以生成 5-10 个变体 → 750-1500 个 SFT 样例。
+
+### 9.3 KernelBench 三个 Level 覆盖
+
+**已确认结构**：
+
+| Level | 问题数 | 示例 | 适配策略 |
+|------|------|------|------|
+| L1 | 100 | ReLU, GELU, RMSNorm, matmul, softmax | 手写 Triton（已有 17 个模式） |
+| L2 | 100 | Conv+ReLU, Matmul+Scale+Sigmoid, Gemm+LeakyReLU | 从 L1 组件组合构造 |
+| L3 | 50 | ResNet, VGG, DenseNet, MobileNet blocks | 用开源 model 实现 |
+
+**数据构造计划**：
+```
+L1 (100 problems):
+  → 利用现有的开源 Triton kernels (triton-lang/kernels, vLLM等) 覆盖
+  → 未覆盖的用大模型生成 + scorer 拒绝采样
+
+L2 (100 problems, fusion patterns):
+  → 人工构造: L1 中的两个独立 kernel 拼接成 fused kernel
+  → 例如: L1 有 "matmul" + L1 有 "ReLU" → 构造 "matmul+ReLU fused"
+
+L3 (50 problems, model blocks):
+  → 利用已有的模型实现（vLLM, torch tunable ops）
+  → 将 model block 拆解为独立可训练的 kernel
+
+总计: 250 problems × 3-5 variants each = 750-1250 SFT exemplars
+```
+
+### 9.4 Cold-Start Drafting 的初始算子来源
+
+该论文的方法不是从零开始——他们有一个 **memory bank**，存储了人类专家设计的 NPU kernel 模板。这些模板来自：
+- 历史项目中积累的算子库
+- 专家手工优化的 kernel 实现
+- 芯片厂商提供的参考实现
+
+**不是 bootstrapping 从零生成出来的。**
+
+对我们的启示：我们同样需要"sFT 数据 = memory bank"。这本就是 SFT 的作用——提供初始的"可编译+正确"代码池，RL 在此基础上优化。如果没有这个 bank，RL 无法冷启动。
+
+### 9.5 绝对 Reward 保底
+
+用户同意：当 GRPO 和 generational advantage 都失效（全组 reward 相同，父子 reward 相同），回退到 scorer 的绝对 reward。
+
+```python
+def compute_robust_advantage(sample_rewards, group_ids, parent_rewards):
+    # 尝试 GRPO
+    adv_grpo = compute_grpo(rewards, group_ids)
+    grpo_valid = group_std > 0.05
+
+    # 尝试 generational
+    adv_gen = (sample_rewards - parent_rewards) / 0.3
+    gen_valid = (parent_rewards > 0).any()
+
+    if grpo_valid and gen_valid:
+        # 两者都有效 → 归一化后等权合并
+        adv_grpo_norm = adv_grpo / adv_grpo.std()
+        adv_gen_norm = adv_gen / adv_gen.std()
+        return 0.5 * adv_grpo_norm + 0.5 * adv_gen_norm
+    elif grpo_valid:
+        return adv_grpo
+    elif gen_valid:
+        return adv_gen
+    else:
+        # 都失效 → 绝对 baseline 保底
+        baseline = 0.15  # "compiled but incorrect" reward floor
+        return (sample_rewards - baseline) / 0.3
+```
+
+### 9.6 下一步执行
+
+1. 从开源仓库收集 ~150 个手写 Triton kernels
+2. 每个 kernel 生成 design + predict（auto-generator）
+3. 变体扩展（不同输入尺寸）→ 750+ SFT 样例
+4. 构建 L1/L2/L3 prompt（从 KernelBench problems）
+5. SFT 训练（用这批干净数据）
+6. SFT 后验证：确认模型不再输出 inductor 模式
+7. 如需要，用 SFT 模型对未覆盖的 L2/L3 问题做拒绝采样，扩充数据集
