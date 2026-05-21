@@ -248,25 +248,60 @@ class KernelEvaluator:
 
     @staticmethod
     def build_feedback(result: EvalResult) -> str:
+        """Build rich environment feedback for model improvement.
+
+        Includes compiler stderr (with source line numbers for debugging),
+        runtime error traces, and performance comparisons.
+        """
         lines = []
         if not result.compiled:
-            lines.append("[COMPILE ERROR]")
-            lines.append(f"  error_type: {result.error_type}")
-            lines.append(f"  message: {result.error_msg[:500]}")
+            lines.append("[COMPILE ERROR] — Your code failed to compile.")
+            lines.append(f"Error type: {result.error_type}")
+            lines.append("Compiler output (use this to fix your code):")
+            # Include compiler stderr with line references
+            stderr = result.error_msg
+            if stderr:
+                # Show first 800 chars of compiler output
+                lines.append(stderr[:800])
+            else:
+                lines.append("(no compiler output captured)")
+            lines.append("")
+            lines.append("HINT: Check @triton.jit syntax, function signatures, "
+                         "and that all triton language imports are present.")
             return "\n".join(lines)
-        lines.append("[COMPILED] OK")
+
+        lines.append("[COMPILED] OK — Your Triton kernel compiled successfully.")
         if not result.correctness:
-            lines.append(f"[CORRECTNESS] FAILED ({result.num_passed_trials}/{result.num_correct_trials} trials)")
+            lines.append(f"[CORRECTNESS] FAILED — Only {result.num_passed_trials}/"
+                         f"{result.num_correct_trials} trials passed.")
             if result.max_diff > 0:
-                lines.append(f"  max_diff: {result.max_diff:.6f}")
+                lines.append(f"Max numerical difference from reference: {result.max_diff:.6f}")
             if result.error_msg:
-                lines.append(f"  error: {result.error_msg[:500]}")
+                lines.append("Runtime error (use this to fix your code):")
+                lines.append(f"  {result.error_msg[:600]}")
+            lines.append("")
+            lines.append("HINT: Check input/output shapes, dtype consistency, "
+                         "and boundary conditions. Does your kernel handle the "
+                         "last partial block correctly?")
             return "\n".join(lines)
-        lines.append(f"[CORRECTNESS] PASS ({result.num_passed_trials}/{result.num_correct_trials} trials)")
+
+        lines.append(f"[CORRECTNESS] PASS — All {result.num_correct_trials} trials correct.")
         if result.speedup > 0:
-            lines.append(f"[PERFORMANCE] runtime={result.runtime_ms:.4f}ms  ref={result.ref_runtime_ms:.4f}ms  speedup={result.speedup:.2f}x")
+            lines.append(f"[PERFORMANCE] Your kernel: {result.runtime_ms:.4f}ms")
+            lines.append(f"[PERFORMANCE] torch.compile baseline: {result.ref_runtime_ms:.4f}ms")
+            lines.append(f"[PERFORMANCE] Speedup: {result.speedup:.2f}x")
+            if result.speedup < 0.8:
+                lines.append("Your kernel is SLOWER than torch.compile. "
+                             "Check: are you reading/writing memory efficiently?")
+            elif result.speedup < 1.0:
+                lines.append("Close to torch.compile but not faster yet. "
+                             "Try larger BLOCK_SIZE or better memory coalescing.")
+            elif result.speedup < 2.0:
+                lines.append("GOOD: faster than torch.compile. Can you push further?")
+            else:
+                lines.append("EXCELLENT: 2x+ speedup over torch.compile!")
         else:
-            lines.append("[PERFORMANCE] not measured")
+            lines.append("[PERFORMANCE] Not measured (correctness must pass first).")
         return "\n".join(lines)
 
     def cleanup(self):

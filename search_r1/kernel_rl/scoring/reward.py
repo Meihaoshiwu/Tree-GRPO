@@ -23,28 +23,55 @@ from .evaluator import EvalResult
 # ══════════════════════════════════════════════════════════════════════
 
 def detect_python_cheating(code_text: str) -> bool:
-    """Return True if the code uses PyTorch ops without calling Triton kernel."""
+    """Return True if the code has @triton.jit but never launches the kernel.
+
+    Uses Python's AST module for reliable structural analysis — not regex
+    (regex can be fooled by strings, comments, or formatting).
+    """
     if not code_text or len(code_text.strip()) < 5:
         return False
-    has_triton_kernel = bool(re.search(r'@triton\.jit', code_text))
-    if not has_triton_kernel:
-        return False  # not even trying to be Triton — handled by compile fail
+    if "@triton.jit" not in code_text:
+        return False
 
-    # Check: Is there a triton kernel launch in a non-decorated function?
-    triton_launch = bool(re.search(
-        r'\w+\s*\[grid\]\(|kernel\s*\[', code_text
-    ))
+    try:
+        import ast
+        tree = ast.parse(code_text)
+    except SyntaxError:
+        return False  # syntax error → compile will fail anyway
 
-    # Check: Are there PyTorch op calls in the wrapper?
-    pytorch_ops = bool(re.search(
-        r'torch\.(nn\.functional\.|Tensor\.|sum\(|mean\(|matmul\(|add\()',
-        code_text
-    ))
+    # Find @triton.jit decorated functions
+    triton_functions = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for dec in node.decorator_list:
+                dec_str = ast.unparse(dec) if hasattr(ast, 'unparse') else ast.dump(dec)
+                if 'triton.jit' in dec_str or 'jit' in dec_str:
+                    triton_functions.add(node.name)
 
-    # Cheating: has @triton.jit but wrapper calls PyTorch instead of launching it
-    if pytorch_ops and not triton_launch:
-        return True
-    return False
+    if not triton_functions:
+        return False
+
+    # Find all function calls
+    triton_launched = False
+    pytorch_called = False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            call_str = ast.unparse(node) if hasattr(ast, 'unparse') else ast.dump(node)
+            # Check if a triton kernel is being called with [grid]
+            for fn_name in triton_functions:
+                if fn_name in call_str and ('[' in call_str or 'grid' in call_str.lower()):
+                    triton_launched = True
+            # Check for PyTorch ops
+            if any(op in call_str for op in [
+                'torch.nn.functional.', 'torch.relu', 'torch.gelu',
+                'torch.softmax', 'torch.matmul', 'F.relu', 'F.gelu',
+                'torch.sum(', 'torch.mean(',
+            ]):
+                pytorch_called = True
+
+    # Cheating: has @triton.jit but wrapper calls PyTorch instead
+    return pytorch_called and not triton_launched
 
 
 # ══════════════════════════════════════════════════════════════════════
