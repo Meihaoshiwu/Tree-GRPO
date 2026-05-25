@@ -22,56 +22,82 @@ from .evaluator import EvalResult
 # Anti-cheat detection
 # ══════════════════════════════════════════════════════════════════════
 
-def detect_python_cheating(code_text: str) -> bool:
-    """Return True if the code has @triton.jit but never launches the kernel.
+def analyze_code_structure(code_text: str) -> dict:
+    """AST-based structural analysis of generated Triton code.
 
-    Uses Python's AST module for reliable structural analysis — not regex
-    (regex can be fooled by strings, comments, or formatting).
+    Returns a dict with:
+      - has_triton_jit: bool — is there a @triton.jit decorated function?
+      - triton_launched: bool — is any @triton.jit kernel called via [...] launch?
+      - pytorch_called: bool — are PyTorch ops called in wrapper code?
+      - is_cheating: bool — has @triton.jit but calls PyTorch without launching Triton
+      - is_parasitic: bool — has @triton.jit but the kernel body is trivially empty (<3 lines)
+
+    Single AST parse replaces both string checks and regex detection.
     """
-    if not code_text or len(code_text.strip()) < 5:
-        return False
-    if "@triton.jit" not in code_text:
-        return False
+    result = {
+        "has_triton_jit": False,
+        "triton_launched": False,
+        "pytorch_called": False,
+        "is_cheating": False,
+        "is_parasitic": False,
+    }
+
+    if not code_text or len(code_text.strip()) < 10:
+        return result
 
     try:
         import ast
         tree = ast.parse(code_text)
     except SyntaxError:
-        return False  # syntax error → compile will fail anyway
+        return result  # syntax error → compile will fail anyway
 
-    # Find @triton.jit decorated functions
-    triton_functions = set()
+    # Find @triton.jit decorated functions and their body sizes
+    triton_functions = {}  # name -> body_line_count
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
             for dec in node.decorator_list:
                 dec_str = ast.unparse(dec) if hasattr(ast, 'unparse') else ast.dump(dec)
                 if 'triton.jit' in dec_str or 'jit' in dec_str:
-                    triton_functions.add(node.name)
+                    # Count non-empty body lines
+                    body_lines = [l for l in ast.unparse(node).split('\n')
+                                  if l.strip() and not l.strip().startswith('#')]
+                    triton_functions[node.name] = len(body_lines)
 
-    if not triton_functions:
-        return False
+    if triton_functions:
+        result["has_triton_jit"] = True
 
-    # Find all function calls
-    triton_launched = False
-    pytorch_called = False
-
+    # Find function calls in non-decorated (wrapper) code
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             call_str = ast.unparse(node) if hasattr(ast, 'unparse') else ast.dump(node)
-            # Check if a triton kernel is being called with [grid]
+            # Triton kernel launch: fn_name[grid](...)
             for fn_name in triton_functions:
                 if fn_name in call_str and ('[' in call_str or 'grid' in call_str.lower()):
-                    triton_launched = True
-            # Check for PyTorch ops
+                    result["triton_launched"] = True
+            # PyTorch ops in wrapper
             if any(op in call_str for op in [
                 'torch.nn.functional.', 'torch.relu', 'torch.gelu',
-                'torch.softmax', 'torch.matmul', 'F.relu', 'F.gelu',
-                'torch.sum(', 'torch.mean(',
+                'torch.softmax', 'torch.matmul', 'torch.sum(', 'torch.mean(',
+                'F.relu', 'F.gelu', 'F.softmax',
             ]):
-                pytorch_called = True
+                result["pytorch_called"] = True
 
-    # Cheating: has @triton.jit but wrapper calls PyTorch instead
-    return pytorch_called and not triton_launched
+    # Cheating: has @triton.jit but never launches it, uses PyTorch instead
+    if result["has_triton_jit"] and result["pytorch_called"] and not result["triton_launched"]:
+        result["is_cheating"] = True
+
+    # Parasitic: has @triton.jit but kernel body is trivially small (empty shell)
+    if result["has_triton_jit"]:
+        min_body = min(triton_functions.values()) if triton_functions else 0
+        if min_body < 3:
+            result["is_parasitic"] = True
+
+    return result
+
+
+def detect_python_cheating(code_text: str) -> bool:
+    """Legacy wrapper — use analyze_code_structure() directly for full info."""
+    return analyze_code_structure(code_text)["is_cheating"]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -85,12 +111,16 @@ def code_reward(
     correctness_ratio: float = 0.0,
     is_cheating: bool = False,
     has_triton_jit: bool = True,
+    is_parasitic: bool = False,
 ) -> float:
     """Speedup-based S-curve + correctness proportion. No penalty for mediocre code.
 
     Penalty exceptions:
-      1. is_cheating: compiled OK but calls PyTorch, never launches Triton → -0.3
-      2. compile_failed + code_too_short: didn't really try → -0.2
+      1. is_cheating: AST detects @triton.jit defined but never launched,
+         PyTorch called instead → -0.3
+      2. no @triton.jit at all + compile failed → -0.2 (didn't even try)
+      3. is_parasitic: @triton.jit exists but kernel body is trivially
+         short (<3 lines) → treated as "didn't try" (0.05 max)
 
     Normal reward:
       - compile failed but tried: 0.05
@@ -101,7 +131,7 @@ def code_reward(
     if is_cheating:
         return -0.3
 
-    if not compiled and not has_triton_jit:
+    if not compiled and (not has_triton_jit or is_parasitic):
         return -0.2
 
     # ── Effort path (compile failed but tried) ─────────────────────
@@ -261,9 +291,11 @@ def compute_rewards(
 
     Returns {"design": ..., "code": ..., "predict": ...}
     """
-    # Anti-cheat: AST-based detection
-    cheating = detect_python_cheating(code_text) if code_text else False
-    has_triton_jit = "@triton.jit" in (code_text or "")
+    # Unified AST analysis — one parse, all structural facts
+    ast_info = analyze_code_structure(code_text) if code_text else {}
+    cheating = ast_info.get("is_cheating", False)
+    has_triton_jit = ast_info.get("has_triton_jit", False)
+    is_parasitic = ast_info.get("is_parasitic", False)
 
     # Correctness proportion
     total_trials = max(result.num_correct_trials, 1)
@@ -276,6 +308,7 @@ def compute_rewards(
         correctness_ratio=correctness_ratio,
         is_cheating=cheating,
         has_triton_jit=has_triton_jit,
+        is_parasitic=is_parasitic,
     )
 
     r_design = design_reward(
