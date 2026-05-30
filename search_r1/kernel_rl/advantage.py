@@ -95,11 +95,14 @@ def compute_multi_section_advantages(
 
             if grpo_valid and gen_valid:
                 # Normalize both to unit variance → equal weight merge
-                adv_combined = adv_grpo / grpo_std + gen / gen_std
+                # gen is per-sample [batch] → expand to token-level [batch, 1]
+                gen_expanded = gen.unsqueeze(-1)
+                adv_combined = adv_grpo / grpo_std + gen_expanded / gen_std
             elif grpo_valid:
                 adv_combined = adv_grpo
             elif gen_valid:
-                adv_combined = gen
+                # Per-sample gen → expand to token-level
+                adv_combined = gen.unsqueeze(-1).expand_as(section_mask)
             else:
                 # Both invalid → absolute baseline fallback
                 mask_sum = section_mask.sum(dim=1).clamp(min=1)

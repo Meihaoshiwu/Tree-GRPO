@@ -48,6 +48,7 @@ if [ -n "$LAST_CKPT" ] && [ -f "$LAST_CKPT/model.safetensors" ]; then
     cp "$LAST_CKPT/config.json" "$FINAL_OUTPUT/"
     cp "$LAST_CKPT/tokenizer.json" "$FINAL_OUTPUT/"
     cp "$LAST_CKPT/tokenizer_config.json" "$FINAL_OUTPUT/"
+    cp "$LAST_CKPT/chat_template.jinja" "$FINAL_OUTPUT/" 2>/dev/null
     cp "$LAST_CKPT/generation_config.json" "$FINAL_OUTPUT/" 2>/dev/null
     echo "Model copied to $FINAL_OUTPUT" | tee -a "$LOG_FILE"
 fi
