@@ -1,3 +1,6 @@
+# H200-optimized config — 141GB VRAM, no memory pressure.
+# Usage: MODEL_PATH=... RUN_DIR=... python -m verl.trainer.main_ppo_kernel --config-name ppo_trainer_kernel_h200
+
 data:
   tokenizer: null
   train_files: data/kernel_rl/train.parquet
@@ -8,12 +11,12 @@ data:
   task_spec_key: task_spec
   bench_spec_key: bench_spec
   reference_python_key: reference_python
-  max_prompt_length: 2048
-  max_response_length: 1024
-  max_start_length: 1024
-  max_obs_length: 1024
-  train_batch_size: 4
-  val_batch_size: 2
+  max_prompt_length: 4096
+  max_response_length: 2048
+  max_start_length: 2048
+  max_obs_length: 2048
+  train_batch_size: 8
+  val_batch_size: 4
   return_raw_input_ids: False
   return_raw_chat: False
   shuffle_train_dataloader: True
@@ -22,20 +25,20 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   model:
-    path: /inspire/qb-ilm/project/wuliqifa/public/sdt/models/Qwen2.5-Coder-7B-Instruct-SFT-kernel-v3
+    path: ${MODEL_PATH}
     external_lib: null
     override_config: {}
-    enable_gradient_checkpointing: True
+    enable_gradient_checkpointing: False
     use_remove_padding: False
   actor:
     strategy: fsdp
     policy_loss: dual_clip
-    ppo_mini_batch_size: 16
-    ppo_micro_batch_size: 4
-    ppo_mini_batch_size_fixed: 16
-    ppo_micro_batch_size_fixed: 4
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size: 8
+    ppo_mini_batch_size_fixed: 32
+    ppo_micro_batch_size_fixed: 8
     use_dynamic_bsz: False
-    ppo_max_token_len_per_gpu: 4096
+    ppo_max_token_len_per_gpu: 16384
     grad_clip: 1.0
     state_masking: False
     clip_ratio: 0.2
@@ -83,16 +86,16 @@ actor_rollout_ref:
     prompt_length: ${data.max_prompt_length}
     response_length: ${data.max_response_length}
     dtype: bfloat16
-    gpu_memory_utilization: 0.55
+    gpu_memory_utilization: 0.85
     ignore_eos: False
     enforce_eager: True
     disable_log_stats: True
-    enable_chunked_prefill: False
+    enable_chunked_prefill: True
     free_cache_engine: False
     load_format: auto
     tensor_model_parallel_size: 1
-    max_num_batched_tokens: 4096
-    max_num_seqs: 32
+    max_num_batched_tokens: 16384
+    max_num_seqs: 64
     log_prob_micro_batch_size: 16
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
@@ -114,7 +117,7 @@ critic:
     tokenizer_path: ${actor_rollout_ref.model.path}
     override_config: {}
     external_lib: ${actor_rollout_ref.model.external_lib}
-    enable_gradient_checkpointing: True
+    enable_gradient_checkpointing: False
     use_remove_padding: False
     fsdp_config:
       param_offload: False
@@ -124,10 +127,10 @@ critic:
         min_num_params: 0
       fsdp_size: -1
   ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
-  ppo_micro_batch_size: 4
+  ppo_micro_batch_size: 8
   forward_micro_batch_size: ${critic.ppo_micro_batch_size}
   use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
-  ppo_max_token_len_per_gpu: 8192
+  ppo_max_token_len_per_gpu: 16384
   forward_max_token_len_per_gpu: ${critic.ppo_max_token_len_per_gpu}
   ulysses_sequence_parallel_size: 1
   ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
@@ -159,22 +162,22 @@ kernel:
     mode: eval
     num_workers: 2
     timeout_s: 300
-    log_dir: ./outputs/kernel_scorer_logs
-  tree_log_dir: ./outputs/kernel_tree_logs
+    log_dir: ${RUN_DIR}/scorer_logs
+  tree_log_dir: ${RUN_DIR}/tree_logs
 
 trainer:
   total_epochs: 10
   total_training_steps: 50
   project_name: verl_kernel
-  experiment_name: qwen25_coder_7b_tree_kernel
+  experiment_name: qwen25_coder_7b_h200
   logger: ['console']
   nnodes: 1
   n_gpus_per_node: 4
-  save_freq: -1
+  save_freq: 10
   test_freq: -1
   critic_warmup: 0
   default_hdfs_dir: ~/experiments/kernel_rl/${trainer.experiment_name}
-  default_local_dir: /tmp/kernel_rl_checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_local_dir: ${RUN_DIR}/checkpoints
 
 max_turns: 1
 do_search: false

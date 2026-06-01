@@ -215,13 +215,16 @@ Qwen2.5-Coder-3B-Instruct，路径：`/inspire/qb-ilm/project/wuliqifa/public/sd
 
 种子任务（任务描述+参考实现，不包含训练信号），路径：`data/kernel_rl/train.parquet`
 
-| 类别 | 任务 | 难度 |
-|------|------|------|
-| elementwise | `vector_add`, `gelu_activation` | easy |
-| reduction | `softmax` | medium |
-| normalization | `layer_norm` | medium |
-| gemm | `matmul_naive` | hard |
-| attention | `attention_score` | hard |
+**24 任务，跨越 3 个 KernelBench 难度级别**：
+
+| Level | 任务数 | 类别 | 示例 |
+|-------|--------|------|------|
+| 1 (easy) | 10 | elementwise, activation, reduction | vector_add, gelu, relu, sigmoid, tanh, swish, leaky_relu, elu, row_sum, row_mean |
+| 2 (medium) | 8 | reduction, normalization, fusion | softmax, layer_norm, rms_norm, argmax, mse_loss, fused_gelu_mul, fused_rmsnorm_residual, batch_norm_forward |
+| 3 (hard) | 6 | gemm, attention, fusion | matmul_naive, attention_score, matmul_tiled, sdpa_full, fused_linear_gelu, fused_matmul_bias_relu |
+
+构建脚本：`scripts/kernel_rl/build_seed_tasks.py`（可复现）
+所有 `input_gen` 参数签名已与 `ref_fn` 验证匹配。
 
 ## 测试与端到端验证
 
@@ -264,13 +267,15 @@ d4a3d6a Enable native vLLM branching and multi-advantage actor loss (+ smoke_adv
 ## 当前状态
 
 ### 已完成
-- ✅ SFT 训练（800 KernelBook 样例, 5 epochs, avg loss 0.09, ~75min, 4×GPU FSDP）
-- ✅ SFT 模型格式验证：未见任务上 100% 输出三段式 + 有效 Triton 代码
-- ✅ RL 端到端链路确认打通（vLLM → tree rollout → scorer → advantage → PPO update）
-- ✅ 评分模块：编译 + 正确性 + 性能，subprocess 隔离，reward 三段可配置
-- ✅ vLLM KV cache 内存分析文档：`docs/vllm_kvcache_memory.md`
-- ✅ 输出目录重定向到 `/tmp`（GPFS 配额仅 368MB，全组共享）
-- 模型：`models/Qwen2.5-Coder-7B-Instruct-SFT-kernel-v2/checkpoint-500/`
+- ✅ SFT v3 训练完成（17 手写 Triton 示例 + size variants, 86 条, 87.5% compile rate, 零 inductor 模式）
+- ✅ RL 端到端链路打通（vLLM → tree rollout → scorer → advantage → PPO update）
+- ✅ 评分模块：编译 + 正确性 + 性能，AST 反作弊, 三段独立 reward（code/design/predict）
+- ✅ 自适应 Advantage：GRPO + Generational 归一化合并，all-zero fallback
+- ✅ 种子任务从 6 扩展到 24（Levels 1/2/3），input_gen 签名全部验证
+- ✅ 奖励设计文档更新（Phase 2 design）
+- ✅ 多步 RL 训练启动（50 步，24 任务）
+- 模型：`models/Qwen2.5-Coder-7B-Instruct-SFT-kernel-v3/` (clean hand-written Triton)
+- Config: `verl/trainer/config/ppo_trainer_kernel.yaml` (total_training_steps=50, adv_estimator=grpo)
 
 ### 已修复的关键阻塞问题
 | 问题 | 根因 | 修复 |
@@ -292,60 +297,9 @@ SFT Model → chat template prompt → vLLM 生成 ~962 tokens → parser 三段
 - 三段 loss 均计算：`pg_loss_design`, `pg_loss_code`, `pg_loss_predict`
 
 ### 已知限制
-- Design 和 predict 的 reward 目前与 code 同向（`scoring/reward.py`），需独立设计
-- 种子任务仅 6 个（`train.parquet`），需扩展到 KernelBench Level 1 规模
-- GRPO advantage estimator 未启用（当前 `no_estimator` = 原始 scores）
-- 训练仅 1 步验证，未做多步 RL
-- SFT 模型输出含 `torch._inductor` 模板代码（KernelBook 数据特征），需 RL 优化去掉
-
-## 下一步：Phase 2 真实 RL 训练
-
-### 目标
-写出至少比 `torch.compile` 性能更高的 Triton 算子，在 KernelBench Level 1 上验证。
-
-### 需要的工作
-
-**1. 种子任务扩展**
-- 从 KernelBench Level 1（100 问题）精选 20-30 个适合 Triton 的问题
-- 每个任务格式：`task_spec(reference_python, ...)` + `bench_spec(input_gen, target_speedup, ...)`
-- 确保 `input_gen` 参数签名与 `reference_python` 一致
-
-**2. Reward 设计——代际差异 + 同深度节点对比**
-```
-当前 reward = 0.3*compile + 0.4*correct + 0.3*perf（三段同向）
-目标 reward:
-  - code:    compile + correctness + speedup（已有，保留）
-  - design:  [父节点 design 策略] 与 [子节点 code 实现] 的一致性
-             + design 中声称的 block_size 是否与 code 中实际的一致
-             + 同级节点间 design 多样性（鼓励探索）
-  - predict: |predicted_speedup - actual_speedup| / max(predicted, actual)
-             越接近实测值分越高
-```
-
-**3. 代际差异 reward（inter-generational）**
-- 子节点 speedup > 父节点 speedup → 正奖励（改进了）
-- 子节点 speedup < 父节点 speedup → 负奖励（退步了）
-- 基于 tree 结构自然获得：child.speedup - parent.speedup
-
-**4. GRPO 同深度对比**
-- 启用 `adv_estimator: grpo`（替代 `no_estimator`）
-- 同一深度节点的 reward 相互对比，计算 group-wise advantage
-- 更平稳的训练：advantage 不再只看绝对值，而是看组内相对表现
-
-**5. 训练配置**
-- Multi-step RL（≥100 步），逐步提升
-- `adv_estimator: grpo`
-- 每步对比训练前后的 KernelBench 指标（compile rate, correctness rate, avg speedup）
-- 日志保留关键 metrics，不自动清理
-
-### 关键文件
-| 文件 | 需修改内容 |
-|------|------|
-| `data/kernel_rl/train.parquet` | 替换为 20-30 个 KernelBench 问题 |
-| `scoring/reward.py` | 新增 design-prediction 一致性 reward、代际差异 reward |
-| `verl/trainer/config/ppo_trainer_kernel.yaml` | `adv_estimator: grpo`、多步训练 |
-| `search_r1/kernel_rl/advantage.py` | 确认 GRPO 同深度节点组正确 |
-| `docs/vllm_kvcache_memory.md` | vLLM KV cache 分析文档 |
+- 多步 RL 训练中（50 步进行中），需观察 compile rate、correctness、speedup 趋势
+- RL 稳定后可启动"优秀代码回炉 SFT"（bootstrapping）
+- H200 部署和测试未开始
 
 ## 存储说明
 - 代码、数据、模型权重：GPFS `/inspire/qb-ilm/project/wuliqifa/public/sdt/`（长期保留）
